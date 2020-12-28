@@ -8,7 +8,7 @@ use yew::prelude::*;
 
 struct Model {
     link: ComponentLink<Self>,
-    value: i64,
+    info_ref: NodeRef,
 }
 
 enum Msg {
@@ -61,7 +61,22 @@ impl<T> ReadCDPRExt for T where T : Read {
     }
 }
 
-async fn read_save_structure(payload: &[u8]) -> Option<()> {
+#[derive(Debug)]
+struct CPSave {
+    payload: Vec<u8>,
+    nodes: Vec<CPNode>,
+}
+
+#[derive(Debug)]
+struct CPNode {
+    name: String,
+    next_idx: i32,
+    child_idx: i32,
+    data_offset: u32,
+    data_size: u32,
+}
+
+async fn read_save_structure(payload: &[u8]) -> Option<CPSave> {
     let mut input = Cursor::new(&payload);
     input.seek(SeekFrom::End(-8)).ok()?;
     let tree_offset = input.read_u32::<LE>().ok()?;
@@ -79,15 +94,22 @@ async fn read_save_structure(payload: &[u8]) -> Option<()> {
     }
     let node_count = input.read_packed_int().ok()?;
     info!("node count: {}", node_count);
+
+    let mut nodes = vec![];
     for _ in 0..node_count {
         let name = input.read_pstr().ok()?;
         let next_idx = input.read_i32::<LE>().ok()?;
         let child_idx = input.read_i32::<LE>().ok()?;
         let data_offset = input.read_u32::<LE>().ok()?;
         let data_size = input.read_u32::<LE>().ok()?;
-        info!("{:?}", (name, next_idx, child_idx, data_offset, data_size));
+        info!("{:?}", (&name, next_idx, child_idx, data_offset, data_size));
+        let node = CPNode { name, next_idx, child_idx, data_offset, data_size };
+        nodes.push(node);
     }
-    Some(())
+    Some(CPSave {
+        payload: payload.into(),
+        nodes,
+    })
 }
 
 impl Component for Model {
@@ -96,7 +118,7 @@ impl Component for Model {
     fn create(_: Self::Properties, link: ComponentLink<Self>) -> Self {
         Self {
             link,
-            value: 0,
+            info_ref: NodeRef::default(),
         }
     }
 
@@ -114,15 +136,41 @@ impl Component for Model {
                     info!("{}: {:?}", i, file);
                     let size = file.size() as i64;
                     let buf_future = wasm_bindgen_futures::JsFuture::from(file.array_buffer());
+                    let info_ref = self.info_ref.clone();
                     wasm_bindgen_futures::spawn_local(async move {
                         match buf_future.await {
                             Ok(buf) => {
                                 let typebuf = js_sys::Uint8Array::new(&buf);
                                 let payload = typebuf.to_vec();
-                                let save = read_save_structure(&payload).await;
+                                if let Some(save) = read_save_structure(&payload).await {
+                                    let mut txt = String::new();
+                                    let mut child_bytes = std::collections::HashMap::new();
+                                    for (idx, node) in save.nodes.iter().enumerate() {
+                                        let mut child_idx = node.child_idx;
+                                        let mut child_sum = 0;
+                                        while child_idx != -1 {
+                                            let child = &save.nodes[child_idx as usize];
+                                            child_sum += child.data_size;
+                                            child_idx = child.next_idx;
+                                        }
+                                        child_bytes.insert(idx, child_sum);
+                                    }
+
+                                    for (idx, node) in save.nodes.iter().enumerate() {
+                                        let total_bytes = node.data_size;
+                                        let child_sum = child_bytes.get(&idx).unwrap();
+                                        let own_bytes = total_bytes - child_sum;
+                                        txt.push_str(&format!("{}: {} own bytes, {} total bytes\n", &node.name, own_bytes, total_bytes));
+                                    }
+                                    info_ref.cast::<web_sys::HtmlPreElement>().unwrap().set_inner_text(&txt);
+                                }
+                                else {
+                                    info_ref.cast::<web_sys::HtmlPreElement>().unwrap().set_inner_text("Could not load save");
+                                }
                             }
                             _ => {
                                 warn!("Could not read file");
+                                info_ref.cast::<web_sys::HtmlPreElement>().unwrap().set_inner_text("Could not read file");
                             }
                         }
                     });
@@ -146,8 +194,9 @@ impl Component for Model {
                 ondragover=self.link.callback(|e| Msg::AllowDrop(e)),
                 ondrop=self.link.callback(|e| Msg::DoDrop(e)),
             >
-                {"Drag savegame here"}
+                {"[drag a sav.dat file onto this header]"}
             </h1>
+            <pre ref=self.info_ref.clone()></pre>
             </>
         }
     }

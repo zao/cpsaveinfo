@@ -1,2 +1,4 @@
+/static
 /target
 Cargo.lock
+*.log
